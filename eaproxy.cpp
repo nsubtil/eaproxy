@@ -1,11 +1,9 @@
 /*
- * eaproxy.cpp: proxies EAP packets across network interfaces
+ * eaproxy.cpp: forwards EAPoL packets across ethernet interfaces
  * 
- * Allows proxying authentication traffic across a gateway that
- * doesn't know how to forward EAP packets. Will also proxy
+ * Allows forwarding authentication traffic across a gateway that
+ * doesn't know how to pass EAP packets. Will also proxy
  * 802.1Q-encapsulated EAP traffic.
- * 
- * Usage: eaproxy <interface 1> <interface 2>
  */
 
 #include <stdio.h>
@@ -14,9 +12,21 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <pcap.h>
+#include <libutil.h>
+#include <signal.h>
 
 #include <string>
 #include <thread>
+
+bool exit_on_success_packet = false;
+char *interface_name_1 = nullptr;
+char *interface_name_2 = nullptr;
+
+bool pidfile_enable = false;
+char *pidfile_path = nullptr;
+struct pidfh *pidfile_handle = nullptr;
+
+extern bool is_eapol_success(const uint8_t *data, uint32_t data_len);
 
 struct capture_interface
 {
@@ -113,6 +123,15 @@ struct capture_interface
                                         packet_data, header->len);
         // fprintf(stderr, "%s: forwarded %d bytes to %s\n",
         //         iface_name.c_str(), bytes_written, output_interface->iface_name.c_str());
+
+        if (exit_on_success_packet)
+        {
+            if (is_eapol_success(packet_data, header->len))
+            {
+                // fprintf(stderr, "%s: forwarded EAPOL success message, exiting\n", iface_name.c_str());
+                exit(0);
+            }
+        }
     }
 
     // pcap callback
@@ -135,16 +154,102 @@ struct capture_interface
     }
 };
 
-int main(int argc, char **argv)
+void usage_exit()
 {
-    if (argc != 3)
+    fprintf(stderr, "usage: eaproxy [-p <pidfile>] [-e] <interface 1> <interface 2>\n");
+    fprintf(stderr, "       -p [<pidfile>]  write PID to pidfile (default: /var/run/eaproxy.pid)\n");
+    fprintf(stderr, "                       exits if PID file already exists\n");
+    fprintf(stderr, "       -e              exits after forwarding an EAP success packet\n");
+    exit(1);
+}
+
+void parse_cmdline(int argc, char **argv)
+{
+    int ch;
+
+    while((ch = getopt(argc, argv, "ep::")) != -1)
     {
-        fprintf(stderr, "usage: %s <interface 1> <interface 2>\n", argv[0]);
+        switch(ch)
+        {
+            case 'e':
+                exit_on_success_packet = true;
+                break;
+            
+            case 'p':
+                pidfile_enable = true;
+                pidfile_path = optarg;
+                break;
+
+            default:
+                usage_exit();
+        }
+    }
+
+    argc -= optind;
+    argv += optind;
+
+    if (argc != 2)
+    {
+        usage_exit();
+    }
+
+    interface_name_1 = argv[0];
+    interface_name_2 = argv[1];
+}
+
+void remove_pidfile()
+{
+    if (pidfile_handle)
+    {
+        pidfile_remove(pidfile_handle);
+        pidfile_handle = nullptr;
+    }
+}
+
+void on_signal(int /* sigtype */)
+{
+    remove_pidfile();
+    exit(1);
+}
+
+void init_pidfile()
+{
+    if (!pidfile_enable)
+    {
+        return;
+    }
+
+    atexit(remove_pidfile);
+    signal(SIGHUP, on_signal);
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    pid_t otherpid;
+    pidfile_handle = pidfile_open(pidfile_path, 0600, &otherpid);
+    if (pidfile_handle == nullptr)
+    {
+        if (errno == EEXIST)
+        {
+            fprintf(stderr, "eaproxy: already running (pid %d)\n", otherpid);
+        } else {
+            fprintf(stderr, "eaproxy: unable to create pid file %s: %s\n",
+                    pidfile_path, strerror(errno));
+        }
+
         exit(1);
     }
 
-    capture_interface iface_1(argv[1]);
-    capture_interface iface_2(argv[2]);
+    atexit(remove_pidfile);
+    pidfile_write(pidfile_handle);
+}
+
+int main(int argc, char **argv)
+{
+    parse_cmdline(argc, argv);
+    init_pidfile();
+
+    capture_interface iface_1(interface_name_1);
+    capture_interface iface_2(interface_name_2);
 
     if (iface_1.init() == false)
     {
